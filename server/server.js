@@ -1,0 +1,344 @@
+import express from "express";
+const app = express();
+import dotenv from "dotenv";
+import mongoose from "mongoose";
+dotenv.config();
+import jwt from "jsonwebtoken";
+import { nanoid } from "nanoid";
+import cors from "cors";
+import admin from "firebase-admin";
+import aws from "aws-sdk";
+const PORT = process.env.PORT || 3000;
+const DB_LOCATION = process.env.DB_LOCATION;
+import serviceAccountKey from "./blog-app-931ce-firebase-adminsdk-d2bc4-9a12eb4328.json" assert { type: "json" };
+import { getAuth } from "firebase-admin/auth";
+
+admin.initializeApp({ credential: admin.credential.cert(serviceAccountKey) });
+app.use(express.json());
+app.use(cors());
+
+import bcrypt from "bcrypt";
+import User from "./Schema/User.js";
+import Blog from "./Schema/Blog.js";
+let emailRegex = /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/; // regex for email
+let passwordRegex = /^(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).{6,20}$/; // regex for password
+(async function main() {
+  mongoose.connect(DB_LOCATION);
+})()
+  .then((result) => {
+    console.log("DB CONNECTED");
+  })
+  .catch((err) => {
+    console.log(err);
+  });
+
+//setting up s3 buckt
+const s3 = new aws.S3({
+  region: "ap-south-1",
+  accessKeyId: process.env.AWS_ACCESS_KEY,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+});
+let generateUploadUrl = () => {
+  let date = new Date();
+  let imageName = `${nanoid()}-${date.getTime()}.jpeg`;
+
+  return s3.getSignedUrlPromise("putObject", {
+    Bucket: "major-mern-blog",
+    Key: imageName,
+    Expires: 1000,
+    ContentType: "image/jpeg",
+  });
+};
+const verifyJwt = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (token == null) {
+    return res.status(401).json({ error: "No access token" });
+  }
+  jwt.verify(token, process.env.SECRET_ACCESS_KEY, (err, user) => {
+    if (err) res.status(403).json({ error: "Access yoken in invalid" });
+    req.user = user.id;
+    next();
+  });
+};
+
+async function generateUsername(email) {
+  let username = email.split("@")[0];
+  let userExists = await User.exists({ "personal_info.username": username });
+  userExists ? (username += nanoid().substring(0, 5)) : "";
+  return username;
+}
+//upload image
+app.get("/get-upload-url", (req, res) => {
+  generateUploadUrl().then((url) => {
+    res.status(200).json({ uploadedUrl: url });
+  });
+});
+const formatDatatoSend = (user) => {
+  const access_token = jwt.sign(
+    { id: user._id },
+    process.env.SECRET_ACCESS_KEY
+  );
+  return {
+    access_token,
+    profile_img: user.personal_info.profile_img,
+    username: user.personal_info.username,
+    fullname: user.personal_info.fullname,
+  };
+};
+
+app.post("/signup", async (req, res) => {
+  let { fullname, email = "", password } = req.body;
+  console.log(req.body);
+  if (fullname.length < 3) {
+    return res
+      .status(403)
+      .json({ error: "Fullname must be at least 3 letters long" });
+  }
+
+  if (!emailRegex.test(email)) {
+    return res
+      .status(403)
+      .json({ error: "Please enter a valid email address" });
+  }
+  if (!passwordRegex.test(password)) {
+    return res.status(403).json({
+      error:
+        "Password should be 6 to 20 letters long including a numeric,uppercase & a lowercase ",
+    });
+  }
+  bcrypt.hash(password, 10, async (err, hash) => {
+    if (err) console.log(err);
+    let username = await generateUsername(email);
+    let user = new User({
+      personal_info: { fullname, email, password: hash, username },
+    });
+    await user
+      .save()
+      .then((u) => res.status(200).json(formatDatatoSend(u)))
+      .catch((e) => {
+        if (e.code == 11000) {
+          return res.status(500).json({ error: "Email already exists" });
+        }
+        return res.status(500).json({ error: e.message });
+      });
+  });
+});
+
+app.post("/signin", (req, res) => {
+  let { email, password } = req.body;
+  User.findOne({ "personal_info.email": email })
+    .then((user) => {
+      if (!user) {
+        return res.status(403).json({ error: "Email not found" });
+      }
+      bcrypt.compare(password, user.personal_info.password, (err, result) => {
+        if (err) {
+          return res
+            .status(403)
+            .json({ error: "Error occured while logging in. Try again" });
+        }
+        if (!result) {
+          return res.status(403).json({ error: "Wrong password" });
+        } else {
+          return res.status(200).json(formatDatatoSend(user));
+        }
+      });
+    })
+    .catch((e) => {
+      res.status(500).json({ error: e.message });
+    });
+});
+app.post("/google-auth", async (req, res) => {
+  const { access_token } = req.body;
+
+  getAuth()
+    .verifyIdToken(access_token)
+    .then(async (decodedUser) => {
+      let { email, name, picture } = decodedUser;
+      picture = picture.replace("s96-c", "s384-c");
+      let user = await User.findOne({ "personal_info.email": email })
+        .select(
+          "personal_info.fullname personal_info.username personal_info.profile_img google_auth"
+        )
+        .then((result) => {
+          console.log(result);
+
+          return result || null;
+        })
+        .catch((err) => {
+          res.status(500).json({ error: err.message });
+        });
+      if (user) {
+        if (!user.google_auth) {
+          //user exixst but not with google auth so tell him to login with password instead
+          return res.status(403).json({
+            error: "This email already exists, please login using password",
+          });
+        }
+      } else {
+        // user already exixt with googleauth so login
+        let username = await generateUsername(email);
+        user = new User({
+          personal_info: {
+            fullname: name,
+            email,
+            profile_img: picture,
+            username,
+          },
+          google_auth: true,
+        });
+        await user
+          .save()
+          .then((u) => {
+            user = u;
+          })
+          .catch((err) => res.status(500).json({ error: err.message }));
+      }
+      return res.status(200).json(formatDatatoSend(user));
+    })
+    .catch((err) => res.status(500).json({ error: err.message }));
+});
+
+//trending blogs
+app.get("/trending-blogs", (req, res) => {
+  let maxLimit = 5;
+  Blog.find({ draft: false })
+    .populate(
+      "author",
+      "personal_info.profile_img personal_info.username personal_info.fullname -_id"
+    )
+    .sort({
+      "activity.total_read": -1,
+      "activity.total_likes": -1,
+      publishedAt: -1,
+    })
+    .select("blog_id title publishedAt -_id")
+    .limit(maxLimit)
+    .then((blogs) => {
+      return res.status(200).json({ blogs });
+    })
+    .catch((err) => {
+      return res.status(500).json({ error: err.message });
+    });
+});
+
+//searchblogs
+app.post("/search-blogs", (req, res) => {
+  let { tag } = req.body;
+  console.log(tag);
+  let findQuery = { tags: tag, draft: false };
+  let maxLimit = 5;
+  Blog.find(findQuery)
+    .populate(
+      "author",
+      "personal_info.profile_img personal_info.username personal_info.fullname -_id"
+    )
+    .sort({ publishedAt: -1 })
+    .select("blog_id title des banner activity tags publishedAt -_id")
+    .limit(maxLimit)
+    .then((blogs) => {
+      return res.status(200).json({ blogs });
+    })
+    .catch((err) => {
+      console.log(err);
+      res.status(500).json({ error: err.message });
+    });
+});
+
+//blogs
+
+app.get("/latest-blogs", (req, res) => {
+  let maxLimit = 5;
+  Blog.find({ draft: false })
+    .populate(
+      "author",
+      "personal_info.profile_img personal_info.username personal_info.fullname -_id"
+    )
+    .sort({ publishedAt: -1 })
+    .select("blog_id title des banner activity tags publishedAt -_id")
+    .limit(maxLimit)
+    .then((blogs) => {
+      return res.status(200).json({ blogs });
+    })
+    .catch((err) => {
+      console.log(err);
+      res.status(500).json({ error: err.message });
+    });
+});
+app.post("/create-blog", verifyJwt, (req, res) => {
+  let authorId = req.user;
+  console.log(authorId);
+
+  let { title, des, banner, tags, content, draft } = req.body;
+  if (!title.length) {
+    return res.json(403).json({ error: "You must provide a valid title" });
+  }
+  if (!draft) {
+    if (!des.length || des.length > 250) {
+      return res.json(430).json({
+        error: "You must Provide a blog description under 250 characters",
+      });
+    }
+    if (!banner.length) {
+      return res
+        .status(403)
+        .json({ error: "You mus provide a banner to publish" });
+    }
+    if (!content.blocks.length) {
+      return res
+        .status(403)
+        .json({ error: "There must be content to publish" });
+    }
+    if (!tags.length || tags.length > 10) {
+      return res
+        .status(403)
+        .json({ error: "please provide tags between 1 to 10" });
+    }
+    tags = tags.map((tag) => tag.toLowerCase());
+  }
+  let blog_id =
+    title
+      .replace(/[^a-zA-Z0-9]/g, "  ")
+      .replace(/\s+/g, "-")
+      .trim() + nanoid(8);
+
+  let blog = new Blog({
+    blog_id,
+    title,
+    banner,
+    des,
+    content,
+    tags,
+    author: authorId,
+    draft: Boolean(draft),
+  });
+  blog
+    .save()
+    .then(() => {
+      let incrementVal = draft ? 0 : 1;
+      User.findOneAndUpdate(
+        { _id: authorId },
+        {
+          $inc: { "account_info.total_posts": incrementVal },
+          $push: { blogs: blog._id },
+        }
+      )
+        .then((user) => {
+          return res.status(200).json({ id: blog.blog_id });
+        })
+        .catch((err) => {
+          return res
+            .status(500)
+            .json({ error: "Failed to update total post number" });
+        });
+    })
+    .catch((err) => {
+      return res.status(500).json({ error: err.message });
+    });
+  console.log(blog_id, tags);
+});
+
+app.listen(PORT, () => {
+  console.log(`Server is listening to the port ${PORT}`);
+});
