@@ -15,7 +15,7 @@ const BlogPostCard = ({ content, author }) => {
   let { fullname, profile_img, username } = author;
   return (
     <Link
-      to={`/blog${id}`}
+      to={`/blog/${id}`}
       className="flex gap-8 items-center border-b border-grey pb-5 mb-4"
     >
       <div className="w-full">

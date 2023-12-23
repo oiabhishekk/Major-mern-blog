@@ -20,6 +20,7 @@ app.use(cors());
 import bcrypt from "bcrypt";
 import User from "./Schema/User.js";
 import Blog from "./Schema/Blog.js";
+import Notification from "./Schema/Notification.js";
 let emailRegex = /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/; // regex for email
 let passwordRegex = /^(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).{6,20}$/; // regex for password
 (async function main() {
@@ -225,16 +226,24 @@ app.get("/trending-blogs", (req, res) => {
 
 //searchblogs
 app.post("/search-blogs", (req, res) => {
-  let { tag } = req.body;
-  console.log(tag);
-  let findQuery = { tags: tag, draft: false };
-  let maxLimit = 5;
+  let { tag, query, author, page, limit, eleminateBlogId } = req.body;
+  let findQuery;
+  if (tag) {
+    findQuery = { tags: tag, draft: false, blog_id: { $ne: eleminateBlogId } };
+  } else if (query) {
+    findQuery = { draft: false, title: new RegExp(query, "i") };
+  } else if (author) {
+    findQuery = { author, draft: false };
+  }
+
+  let maxLimit = limit ? limit : 2;
   Blog.find(findQuery)
     .populate(
       "author",
       "personal_info.profile_img personal_info.username personal_info.fullname -_id"
     )
     .sort({ publishedAt: -1 })
+    .skip((page - 1) * maxLimit)
     .select("blog_id title des banner activity tags publishedAt -_id")
     .limit(maxLimit)
     .then((blogs) => {
@@ -248,7 +257,8 @@ app.post("/search-blogs", (req, res) => {
 
 //blogs
 
-app.get("/latest-blogs", (req, res) => {
+app.post("/latest-blogs", (req, res) => {
+  let { page } = req.body;
   let maxLimit = 5;
   Blog.find({ draft: false })
     .populate(
@@ -257,6 +267,7 @@ app.get("/latest-blogs", (req, res) => {
     )
     .sort({ publishedAt: -1 })
     .select("blog_id title des banner activity tags publishedAt -_id")
+    .skip((page - 1) * maxLimit)
     .limit(maxLimit)
     .then((blogs) => {
       return res.status(200).json({ blogs });
@@ -266,11 +277,70 @@ app.get("/latest-blogs", (req, res) => {
       res.status(500).json({ error: err.message });
     });
 });
+
+app.post("/search-blogs-count", (req, res) => {
+  let { tag, query, author } = req.body;
+  let findQuery;
+  if (tag) {
+    findQuery = { tags: tag, draft: false };
+  } else if (query) {
+    findQuery = { draft: false, title: new RegExp(query, "i") };
+  } else if (author) {
+    findQuery = { author, draft: false };
+  }
+
+  Blog.countDocuments(findQuery)
+    .then((count) => {
+      return res.status(200).json({ totalDocs: count });
+    })
+    .catch((e) => {
+      console.log(e.message);
+      return res.status(500).json({ error: e.message });
+    });
+});
+app.post("/search-users", (req, res) => {
+  let { query } = req.body;
+  User.find({ "personal_info.username": new RegExp(query, "i") })
+    .limit(50)
+    .select(
+      "personal_info.username personal_info.fullname personal_info.profile_img -_id"
+    )
+    .then((users) => {
+      return res.status(200).json({ users });
+    })
+    .catch((err) => {
+      return res.status(500).json({ error: err.message });
+    });
+});
+
+app.post("/get-profile", (req, res) => {
+  let { username } = req.body;
+  User.findOne({ "personal_info.username": username })
+    .select("-personal_info.password -google_auth -updateAt -blogs")
+    .then((user) => {
+      return res.status(200).json(user);
+    })
+    .catch((e) => {
+      return res.status(500).json({ error: e.message });
+    });
+});
+
+app.post("/all-latest-blogs-count", (req, res) => {
+  Blog.countDocuments({ draft: false })
+    .then((count) => {
+      return res.status(200).json({ totalDocs: count });
+    })
+    .catch((e) => {
+      console.log(e.message);
+      return res.status(500).json({ error: e.message });
+    });
+});
+
 app.post("/create-blog", verifyJwt, (req, res) => {
   let authorId = req.user;
   console.log(authorId);
 
-  let { title, des, banner, tags, content, draft } = req.body;
+  let { title, des, banner, tags, content, draft, id } = req.body;
   if (!title.length) {
     return res.json(403).json({ error: "You must provide a valid title" });
   }
@@ -297,46 +367,133 @@ app.post("/create-blog", verifyJwt, (req, res) => {
     }
     tags = tags.map((tag) => tag.toLowerCase());
   }
+
   let blog_id =
+    id ||
     title
       .replace(/[^a-zA-Z0-9]/g, "  ")
       .replace(/\s+/g, "-")
       .trim() + nanoid(8);
 
-  let blog = new Blog({
-    blog_id,
-    title,
-    banner,
-    des,
-    content,
-    tags,
-    author: authorId,
-    draft: Boolean(draft),
-  });
-  blog
-    .save()
-    .then(() => {
-      let incrementVal = draft ? 0 : 1;
-      User.findOneAndUpdate(
-        { _id: authorId },
-        {
-          $inc: { "account_info.total_posts": incrementVal },
-          $push: { blogs: blog._id },
-        }
-      )
-        .then((user) => {
-          return res.status(200).json({ id: blog.blog_id });
-        })
-        .catch((err) => {
-          return res
-            .status(500)
-            .json({ error: "Failed to update total post number" });
-        });
-    })
-    .catch((err) => {
-      return res.status(500).json({ error: err.message });
+  if (id) {
+    Blog.findOneAndUpdate(
+      { blog_id },
+      { title, des, banner, content, tags, draft: draft ? draft : false }
+    )
+      .then(() => {
+        return res.status(200).json({ id: blog_id });
+      })
+      .catch((e) => {
+        return res.status(500).json({ error: e.message });
+      });
+  } else {
+    let blog = new Blog({
+      blog_id,
+      title,
+      banner,
+      des,
+      content,
+      tags,
+      author: authorId,
+      draft: Boolean(draft),
     });
+    blog
+      .save()
+      .then(() => {
+        let incrementVal = draft ? 0 : 1;
+        User.findOneAndUpdate(
+          { _id: authorId },
+          {
+            $inc: { "account_info.total_posts": incrementVal },
+            $push: { blogs: blog._id },
+          }
+        )
+          .then((user) => {
+            return res.status(200).json({ id: blog.blog_id });
+          })
+          .catch((err) => {
+            return res
+              .status(500)
+              .json({ error: "Failed to update total post number" });
+          });
+      })
+      .catch((err) => {
+        return res.status(500).json({ error: err.message });
+      });
+  }
+
   console.log(blog_id, tags);
+});
+
+app.post("/get-blog", (req, res) => {
+  let { blog_id, draft, mode } = req.body;
+  let incrementVal = mode != "edit" ? 1 : 0;
+
+  Blog.findOneAndUpdate(
+    { blog_id },
+    { $inc: { "activity.total_reads": incrementVal } }
+  )
+    .populate(
+      "author",
+      "personal_info.fullname personal_info.username personal_info.profile_img"
+    )
+    .select("title des content banner activity publishedAt blog_id tags")
+    .then((blog) => {
+      res.status(200).json({ blog });
+      User.findOneAndUpdate(
+        { "personal_info.username": blog.author.personal_info.username },
+        { $inc: { "account_info.total_reads": incrementVal } }
+      ).catch((e) => {
+        return res.status(500).json({ error: e.message });
+      });
+      if (blog.draft$ && !draft) {
+        return res.status(500).json({ error: "'you cant acsess draft blogs" });
+      }
+    })
+    .catch((e) => {
+      res.status(500).json({ error: e.message });
+    });
+});
+app.post("/like-blog", verifyJwt, (req, res) => {
+  let user_id = req.user;
+  let { _id, isLikedByUser } = req.body;
+  let incrementVal = !isLikedByUser ? 1 : -1;
+  Blog.findOneAndUpdate(
+    { _id },
+    { $inc: { "activity.total_likes": incrementVal } }
+  ).then((blog) => {
+    if (!isLikedByUser) {
+      let like = new Notification({
+        type: "like",
+        blog: _id,
+        notification_for: blog.author,
+        user: user_id,
+      });
+      like.save().then((notification) => {
+        return res.status(200).json({ liked_by_user: true });
+      });
+    } else {
+      Notification.findOneAndDelete({ user: user_id, blog: _id, type: "like" })
+        .then((data) => {
+          return res.status(200).json({ liked_by_user: false });
+        })
+        .catch((e) => {
+          return res.status(500).json({ error: e.message });
+        });
+    }
+  });
+});
+
+app.post("/isLiked-by-user", verifyJwt, (req, res) => {
+  let user_id = req.user;
+  let { _id } = req.body;
+  Notification.exists({ user: user_id, type: "like", blog: _id })
+    .then((result) => {
+      return res.status(200).json({ result });
+    })
+    .catch((e) => {
+      return res.status(500).json({ error: e.message });
+    });
 });
 
 app.listen(PORT, () => {

@@ -1,6 +1,6 @@
-POST  http://localhost:3000/search-blogs
+POST  http://localhost:3000/get-blog
 Content-Type: application/json
 
 {
-  "tag":"tags"
+  "blog_id":"Why-everyone-should-do-cooking-5qDFr83x"
 }
