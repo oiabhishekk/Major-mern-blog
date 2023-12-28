@@ -11,6 +11,7 @@ import aws from "aws-sdk";
 const PORT = process.env.PORT || 3000;
 const DB_LOCATION = process.env.DB_LOCATION;
 import serviceAccountKey from "./blog-app-931ce-firebase-adminsdk-d2bc4-9a12eb4328.json" assert { type: "json" };
+import Comment from "./Schema/Comment.js";
 import { getAuth } from "firebase-admin/auth";
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccountKey) });
@@ -57,7 +58,7 @@ const verifyJwt = (req, res, next) => {
     return res.status(401).json({ error: "No access token" });
   }
   jwt.verify(token, process.env.SECRET_ACCESS_KEY, (err, user) => {
-    if (err) res.status(403).json({ error: "Access yoken in invalid" });
+    if (err) res.status(403).json({ error: "Access token in invalid" });
     req.user = user.id;
     next();
   });
@@ -447,7 +448,7 @@ app.post("/get-blog", (req, res) => {
         return res.status(500).json({ error: e.message });
       });
       if (blog.draft$ && !draft) {
-        return res.status(500).json({ error: "'you cant acsess draft blogs" });
+        return res.status(500).json({ error: "'you cant access draft blogs" });
       }
     })
     .catch((e) => {
@@ -495,6 +496,67 @@ app.post("/isLiked-by-user", verifyJwt, (req, res) => {
       return res.status(500).json({ error: e.message });
     });
 });
+app.post("/add-comment", verifyJwt, (req, res) => {
+  let user_id = req.user;
+  let { _id, comment, blog_author } = req.body;
+  if (!comment.length) {
+    return res.status(403).json({ error: "Write something to post a comment" });
+  }
+  let commentObj = new Comment({
+    blog_id: _id,
+    blog_author,
+    comment,
+    commented_by: user_id,
+  });
+  commentObj.save().then((commentFile) => {
+    let { comment, commentedAt, children } = commentFile;
+    Blog.findOneAndUpdate(
+      { _id },
+      {
+        $push: { comments: commentFile._id },
+        $inc: { "activity.total_comments": 1 },
+        "activity.total_parent_comments": 1,
+      }
+    ).then((blog) => {
+      console.log("New comment created");
+    });
+
+    let notificaionObj = {
+      type: "comment",
+      blog: _id,
+      notification_for: blog_author,
+      user: user_id,
+      comment: commentFile._id,
+    };
+    new Notification(notificaionObj).save().then((notification) => {
+      console.log("New notification created");
+    });
+
+    return res.status(200).json({
+      comment,
+      commentedAt,
+      _id: commentFile._id,
+      user_id,
+      children,
+    });
+  });
+});
+app.post("/get-blog-comments",(req,res)=>{
+  let {blog_id,skip}=req.body;
+  let maxLimit=5
+  Comment.find({blog_id,isReply:false}).populate("commented_by","personal_info.username personal_info.fullname personal_info.profile_img")
+  .skip(skip)
+  .limit(maxLimit)
+  .sort({'commentedAt':-1})
+  .then(comment=>{
+    return res.status(200).json(comment)
+  })
+  .catch((e)=>{
+    console.log(e.message)
+    return res.json({"error":e.message}).status(500)
+  })
+
+})
 
 app.listen(PORT, () => {
   console.log(`Server is listening to the port ${PORT}`);
